@@ -50,7 +50,6 @@ __all__ = [
     'ConsoleManager'
 ]
 
-
 class MsfRpcError(Exception):
     pass
 
@@ -200,9 +199,25 @@ class MsfRpcClient(object):
         self.encodings = kwargs.get('encodings', ['utf-8'])
         self.decode_error_handling: str = kwargs.get('decode_error_handling', 'strict')
         self.headers = {"Content-type": "binary/message-pack"}
+        self.persistentlogin = True  # If True, the login token will not be removed on logout
+
         if self.token is None:
             self.login(kwargs.get('username', 'msf'), password)
 
+    def __persistentlogin__(self, value=None):
+        """
+        Get or set whether the login token should be removed on logout.
+        If called without arguments, returns the current value.
+        If called with a boolean, sets the value.
+        If called with a Number, raises TypeError.
+        """
+        if value is None:
+            return self.persistentlogin
+        if isinstance(value, bool):
+            self.persistentlogin = value
+        elif isinstance(value, Number):
+            raise TypeError("Expected a boolean value for persistentlogin")
+            
     def call(self, method, opts=None, is_raw=False):
         if not isinstance(opts, list):
             opts = []
@@ -247,17 +262,18 @@ class MsfRpcClient(object):
 
     def add_perm_token(self):
         """
-        Add a permanent UUID4 API token
+        Add a UUID4 API token
         """
         token = str(uuid.uuid4())
         self.call(MsfRpcMethod.AuthTokenAdd, [token])
         return token
 
     def logout(self):
-        """
-        Logs the current user out. Note: do not call directly.
-        """
-        self.call(MsfRpcMethod.AuthLogout, [self.token])
+        """Logs out and removes the API token"""
+        if self.token and not self.__persistentlogin__:
+            self.call(MsfRpcMethod.AuthLogout, [self.token])
+            self.call(MsfRpcMethod.AuthTokenRemove, [self.token])
+            self.token = None
 
     @property
     def core(self):
@@ -1421,6 +1437,39 @@ class MsfModule(object):
         except (msgpack.exceptions.ExtraData, UnicodeDecodeError):
             return payload
         return payload
+    
+    def _handle_payload(self, runopts, payload):
+        """Centralized payload handling for exploits"""
+        if not payload:
+            if 'DisablePayloadHandler' not in runopts or not runopts['DisablePayloadHandler']:
+                runopts['DisablePayloadHandler'] = True
+            return runopts
+        
+        # Only ExploitModules should handle payloads
+        if not isinstance(self, ExploitModule):
+            return runopts  # Silently ignore payload for non-exploits
+        
+        if isinstance(payload, PayloadModule):
+            if payload.modulename not in self.payloads:
+                raise ValueError(f'Invalid payload ({payload.modulename}) for target ({self.target})')
+            runopts['PAYLOAD'] = payload.modulename
+            
+            # Merge payload options without overwriting existing settings
+            for k, v in payload.runoptions.items():
+                if v is None or (isinstance(v, str) and not v):
+                    continue
+                if k not in runopts or not runopts[k]:
+                    runopts[k] = v
+                    
+        elif isinstance(payload, str):
+            if payload not in self.payloads:
+                raise ValueError(f'Invalid payload ({payload}) for target ({self.target})')
+            runopts['PAYLOAD'] = payload
+            
+        else:
+            raise TypeError(f"Expected PayloadModule or str, got {type(payload).__name__}")
+            
+        return runopts
 
     def execute(self, **kwargs):
         """
@@ -1431,35 +1480,17 @@ class MsfModule(object):
         - **kwargs : can contain any module options.
         """
         runopts = self.runoptions.copy()
+        
+        # Handle exploit-specific payload logic
         if isinstance(self, ExploitModule):
-            payload = kwargs.get('payload')
             runopts['TARGET'] = self.target
-            if 'DisablePayloadHandler' in runopts and runopts['DisablePayloadHandler']:
-                pass
-            elif payload is None:
-                runopts['DisablePayloadHandler'] = True
-            else:
-                if isinstance(payload, PayloadModule):
-                    if payload.modulename not in self.payloads:
-                        raise ValueError(
-                            'Invalid payload (%s) for given target (%d).' % (payload.modulename, self.target)
-                        )
-                    runopts['PAYLOAD'] = payload.modulename
-                    for k, v in payload.runoptions.items():
-                        if v is None or (isinstance(v, str) and not v):
-                            continue
-                        if k not in runopts or runopts[k] is None or \
-                                (isinstance(runopts[k], str) and not runopts[k]):
-                            runopts[k] = v
-                #                    runopts.update(payload.runoptions)
-                elif isinstance(payload, str):
-                    if payload not in self.payloads:
-                        raise ValueError('Invalid payload (%s) for given target (%d).' % (payload, self.target))
-                    runopts['PAYLOAD'] = payload
-                else:
-                    raise TypeError("Expected type str or PayloadModule not '%s'" % type(kwargs['payload']).__name__)
-
-        return self.rpc.call(MsfRpcMethod.ModuleExecute, [self.moduletype, self.modulename, runopts])
+            runopts = self._handle_payload(runopts, kwargs.get('payload'))
+        
+        # Merge additional runtime options
+        runopts.update({k: v for k, v in kwargs.items() if k != 'payload'})
+        
+        return self.rpc.call(MsfRpcMethod.ModuleExecute, 
+                            [self.moduletype, self.modulename, runopts])
 
     def check(self, **kwargs):
         """
@@ -1468,37 +1499,26 @@ class MsfModule(object):
         Optional Keyword Arguments:
         - **kwargs : can contain any module options.
         """
+        # Create a copy of module options
         runopts = self.runoptions.copy()
+        
+        # First merge user-provided options (except payload)
+        user_opts = {k: v for k, v in kwargs.items() if k != 'payload'}
+        runopts.update(user_opts)
+        
+        # Handle exploit-specific logic
         if isinstance(self, ExploitModule):
-            payload = kwargs.get('payload')
+            # Ensure target is set (user options might override)
             runopts['TARGET'] = self.target
-            if 'DisablePayloadHandler' in runopts and runopts['DisablePayloadHandler']:
-                pass
-            elif payload is None:
-                runopts['DisablePayloadHandler'] = True
-            else:
-                if isinstance(payload, PayloadModule):
-                    if payload.modulename not in self.payloads:
-                        raise ValueError(
-                            'Invalid payload (%s) for given target (%d).' % (payload.modulename, self.target)
-                        )
-                    runopts['PAYLOAD'] = payload.modulename
-                    for k, v in payload.runoptions.items():
-                        if v is None or (isinstance(v, str) and not v):
-                            continue
-                        if k not in runopts or runopts[k] is None or \
-                                (isinstance(runopts[k], str) and not runopts[k]):
-                            runopts[k] = v
-                #                    runopts.update(payload.runoptions)
-                elif isinstance(payload, str):
-                    if payload not in self.payloads:
-                        raise ValueError('Invalid payload (%s) for given target (%d).' % (payload, self.target))
-                    runopts['PAYLOAD'] = payload
-                else:
-                    raise TypeError("Expected type str or PayloadModule not '%s'" % type(kwargs['payload']).__name__)
-
-        return self.rpc.call(MsfRpcMethod.ModuleCheck, [self.moduletype, self.modulename, runopts])
-
+            
+            # Process payload if provided
+            runopts = self._handle_payload(runopts, kwargs.get('payload'))
+            
+            # Always disable payload handler for checks
+            runopts['DisablePayloadHandler'] = True
+        
+        return self.rpc.call(MsfRpcMethod.ModuleCheck, 
+                            [self.moduletype, self.modulename, runopts])
 
 class ExploitModule(MsfModule):
 
@@ -2146,34 +2166,41 @@ class ShellSession(MsfSession):
 
 class SessionManager(MsfManager):
 
+
     @property
     def list(self):
         """
         A list of active sessions.
-        """
-        return {str(k): v for k, v in self.rpc.call(MsfRpcMethod.SessionList).items()}  # Convert int id to str
 
+        Return session list with native integer IDs
+        """
+        return self.rpc.call(MsfRpcMethod.SessionList)
+    
     def session(self, sid):
-        """
-        Returns a session object for meterpreter or shell sessions.
-
-        Mandatory Arguments:
-        - sid : the session identifier or uuid
-        """
         s = self.list
-        if sid not in s:
-            for k in s:
-                if s[k]['uuid'] == sid:
-                    if s[k]['type'] == 'meterpreter':
-                        return MeterpreterSession(k, self.rpc, s)
-                    elif s[k]['type'] == 'shell':
-                        return ShellSession(k, self.rpc, s)
-            raise KeyError('Session ID (%s) does not exist' % sid)
-        if s[sid]['type'] == 'meterpreter':
-            return MeterpreterSession(sid, self.rpc, s)
-        elif s[sid]['type'] == 'shell':
-            return ShellSession(sid, self.rpc, s)
-        raise NotImplementedError('Could not determine session type: %s' % s[sid]['type'])
+        # Handle UUID lookup (string)
+        for session_id, session_data in s.items():
+            if session_data.get('uuid') == sid:
+                return self._create_session(session_id, s, session_data)
+        
+        # Handle integer ID
+        try:
+            int_id = int(sid) if isinstance(sid, str) else sid
+            if int_id in s:
+                return self._create_session(int_id, s, s[int_id])
+        except (ValueError, TypeError):
+            pass
+        
+        raise KeyError(f'Session ID ({sid}) does not exist')
+    
+    def _create_session(self, session_id, session_data_dict, session_data):
+        """PRIVATE method - maintain backward compatibility"""
+        stype = session_data['type']
+        if stype == 'meterpreter':
+            return MeterpreterSession(session_id, self.rpc, session_data_dict)
+        elif stype == 'shell':
+            return ShellSession(session_id, self.rpc, session_data_dict)
+        raise NotImplementedError(f'Unsupported session type: {stype}')
 
 
 class MsfConsole(object):
@@ -2316,20 +2343,20 @@ class ConsoleManager(MsfManager):
         return self.rpc.call(MsfRpcMethod.ConsoleList)['consoles']
 
     def console(self, cid=None):
-        """
-        Connect to an active console otherwise create a new console.
-
-        Optional Keyword Arguments:
-        - cid : the console identifier.
-        """
-        s = [i['id'] for i in self.list]
+        consoles = self.list
+        console_ids = [c['id'] for c in consoles]
+        
         if cid is None:
             return MsfConsole(self.rpc)
-        if cid not in s:
-            raise KeyError('Console ID (%s) does not exist' % cid)
-        else:
+        
+        # Handle string representations of integers
+        if isinstance(cid, str) and cid.isdigit():
+            cid = int(cid)
+            
+        if cid in console_ids:
             return MsfConsole(self.rpc, cid=cid)
-
+        
+        raise KeyError(f'Console ID ({cid}) does not exist')
     def destroy(self, cid):
         """
         Destroy an active console.
